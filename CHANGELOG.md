@@ -1,34 +1,43 @@
 # Changelog
 
-This changelog intentionally starts at **0.1.0**.
+## 0.2.0 - Unreleased
 
-## Unreleased
-- target Pi 0.80.9 and the `@earendil-works/*` package namespace
-- align compaction fallback, Responses payload normalization, Codex identity headers, and WebSocket behavior with Pi 0.80.9
-- replace the legacy `/responses/compact` call with Codex's current Responses compaction v2 protocol
-- stream a normal Responses request with a trailing `compaction_trigger` and persist the returned `compaction` item
-- retain recent user messages with the same 20K-token budget shape used by Codex while continuing to read legacy version 1 session artifacts
-- add a reproducible native-vs-text compaction benchmark, retained GPT-5.6 Sol evidence, and a standalone report
-- add a fixed-context, information-density-calibrated product-defaults benchmark comparing Pi's real default compactor with the extension's real native replay policy
-- correct the earlier benchmark's same-budget interpretation: its text cap was selected after observing native output usage
+- target Pi `>=0.84.1 <0.85.0` and Node `>=22.19.0`
+- preserve Pi's native OpenAI provider and remove the custom WebSocket transport override
+- remove `previous_response_id`, forced `store: true`, and `context_management` request mutation
+- replay validated opaque history for both direct OpenAI and OpenAI Codex through `before_provider_request`
+- discard remote compaction when no non-empty portable summary is available
+- fall back to the portable summary when only remote compaction fails
+- strictly validate returned and persisted messages, model keys, encrypted content, artifact count, and artifact order
+- reject malformed persisted remote details as a complete unit instead of filtering individual items
+- include Pi's existing portable summary when creating the first remote artifact in an already-compacted session
+- require provider, API, and model matches for post-compaction assistant turns
+- quarantine aborted and settled failed turns while preserving automatic retry continuity
+- make selected credentials and session-derived Codex identity headers authoritative over inherited headers
+- add a five-minute per-attempt timeout and at most two retries for classified transient failures
+- treat caller aborts, malformed output, provider errors, and permanent `4xx` responses as non-retryable
+- key observed Responses request settings by model to prevent stale settings after model changes
+- expand offline checks for provider ownership, disabled replay, malformed data, repeated compaction, header precedence, timeout, and retry behavior
+- update package metadata and installation instructions for the maintained fork
 
-During local development on 2026-04-09, the project used temporary internal version bumps while features, tests, docs, and packaging were being assembled. Those local-only bumps were collapsed before the first public push so the repository does not imply a longer tracked public release history than it actually has.
+This version also includes the upstream work after 0.1.0:
+
+- replace legacy `/responses/compact` calls with Responses compaction v2 and a trailing `compaction_trigger`
+- retain recent user messages with a 20K approximate token budget
+- preserve version 1 session artifact compatibility
+- mirror observed Responses reasoning and text settings into compaction requests
+- persist compaction usage metadata
+- add product-defaults and native-vs-text benchmark evidence and methodology corrections
 
 ## 0.1.0 - 2026-04-09
+
 - initial public release
-- added hybrid Codex-style remote compaction for direct OpenAI Responses models
-- added OpenAI `POST /v1/responses/compact` integration
-- persisted opaque replacement history in Pi compaction details
-- reconstructed remote compaction state across resume/reload/tree navigation
-- added WS-backed continuation and conservative `previous_response_id` reuse
-- tightened direct OpenAI continuation so unchanged request shapes send only incremental post-turn deltas instead of replaying full input alongside `previous_response_id`
-- fixed reconstructed post-compaction remote replay to exclude turns completed by other models after later resume/tree reconstruction
-- kept portable Pi text summaries as the readable fallback and non-OpenAI portability path
-- hardened cross-model runtime state handling and remote output validation
-- mirrored observed Responses `reasoning` and `text` tuning into remote compaction requests when available, with thinking-level fallback for reasoning
-- fixed the direct OpenAI WS path to carry reasoning configuration and encrypted-reasoning inclusion like Pi's normal HTTP Responses path
-- persisted remote compaction usage metadata when the backend returns it
-- added a reduced-plaintext live replay regression with tiny Pi `keepRecentTokens`
-- added a live Pi RPC regression harness in `tests/live/openai-compaction-rpc-live.ts`
-- added a local smoke harness that bootstraps Pi peer-package links and runs small regression checks
-- added `ARCHITECTURE.md`, testing docs, packaging polish, and MIT licensing
+- add hybrid remote compaction for direct OpenAI Responses models
+- add legacy `POST /v1/responses/compact` integration
+- persist opaque replacement history in Pi compaction details
+- reconstruct remote state across resume, reload, and tree navigation
+- add a custom WebSocket transport and conservative `previous_response_id` reuse
+- preserve portable Pi text summaries as the readable fallback
+- filter post-compaction turns from other models during reconstruction
+- add live Pi RPC and offline smoke harnesses
+- add architecture, test, validation, benchmark, packaging, and license documentation

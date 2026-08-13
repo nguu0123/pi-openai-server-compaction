@@ -1,6 +1,29 @@
 # Validation
 
-## Current Responses compaction v2 validation
+## Version 0.2 local validation
+
+The hardening changes compile and pass the offline smoke suite with Pi `0.84.1` dependencies:
+
+```text
+npm test
+typecheck: passed
+smoke: passed
+```
+
+The smoke suite verifies native-provider ownership, disabled replay, Pi-core summary projection with opaque details ignored, strict output and persistence validation, authorization and identity-header precedence, transient retry bounds, permanent-error handling, timeout, failed/aborted turn quarantine with automatic-retry continuity, repeated compaction reconstruction, and the existing serializer/replay helpers.
+
+Pi `0.84.1` also loaded the extension successfully without making a model request:
+
+```text
+pi --no-extensions -e ./src/index.ts --list-models
+exit: 0
+```
+
+`npm audit --omit=dev` reported zero vulnerabilities. `npm pack --dry-run` produced a package containing only the active runtime modules and documentation.
+
+The credential-backed live suite has **not** been rerun for version 0.2. The live results below are retained upstream evidence from before the provider-override removal. They do not prove that the current fork passes against Pi `0.84.1`.
+
+## Retained upstream Responses compaction v2 validation
 
 The full live Pi RPC suite passes with both:
 
@@ -75,7 +98,7 @@ The model replied:
 
 This confirms that the OpenAI compaction endpoint is real, returns opaque compaction artifacts, and that replaying those artifacts in later Responses requests does preserve continuity across the compaction boundary.
 
-## Live Pi RPC tests
+## Retained upstream live Pi RPC tests
 
 A full live Pi RPC test run also passed using this extension.
 
@@ -121,11 +144,14 @@ Validated end-to-end:
 
 This confirms the extension uses Responses compaction v2 artifacts in a way that materially affects continuity, while keeping Pi operational across key session features on both the direct API provider and the OpenAI Codex subscription provider.
 
-## Hardening notes
+## Version 0.2 hardening notes
 
-After the first successful live pass, an additional cleanup/hardening pass was applied:
+The maintained fork adds these changes after the retained live pass:
 
 - in-memory remote history is now only extended when the active model still matches the compaction model, preventing cross-model pollution during `/model` round-trips
 - local portable-summary generation now falls back to Pi's built-in compaction helper if the full-branch summary attempt fails
-- remote compaction output is now shape-checked before being persisted or reconstructed from session details
-- the WebSocket connection manager now handles reconnect scheduling and pre-open close/error cases more defensively
+- remote compaction is discarded when both portable summary paths fail
+- returned and persisted replacement history is strictly validated as a complete unit
+- inherited authorization headers cannot replace the selected credential
+- remote requests use bounded timeout and classified transient retries
+- Pi's native OpenAI provider now owns all normal request transport and streaming

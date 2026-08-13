@@ -1,86 +1,135 @@
-# TESTPLAN
+# Test plan
 
 ## Goals
 
-1. Verify supported OpenAI-compatible Responses sessions use the expected continuity path:
-   - `store: true`
-   - `context_management`
-   - `previous_response_id` when safe
-   - `/v1/responses` with a trailing `compaction_trigger` during Pi compaction
-2. Verify Pi remains usable:
-   - `/model`
-   - `/tree`
-   - session resume/reload
-   - cost totals on WS path are non-zero and plausible
+1. Verify Responses compaction v2 request and replay behavior.
+2. Verify that Pi retains its native provider transport.
+3. Verify that every accepted opaque artifact has a portable summary.
+4. Verify fail-closed handling for malformed or incompatible persisted state.
+5. Verify bounded network failure behavior.
+6. Verify resume, fork, tree, repeated compaction, and model-switch safety.
 
-## Suggested manual tests
+## Offline automated checks
 
-### 1. Baseline supported turn
-- Start Pi with this extension enabled.
-- Use either:
-  - a direct `openai/*` Responses model, or
-  - an `openai-codex/*` model
-- Confirm normal response succeeds.
-
-### 2. Live continuation path
-- Run a multi-turn session with tool calls.
-- For direct `openai/*`, confirm later requests use `previous_response_id` or WS continuation.
-- For `openai-codex/*`, confirm normal Codex transport behavior remains intact.
-- Confirm no obvious continuity drop across normal turns.
-
-### 3. Remote compaction path
-- Force `/compact` in a supported session.
-- Confirm extension returns a Pi compaction entry.
-- Inspect the session JSONL and confirm `details.remoteCompaction.replacementHistory` exists.
-- Continue the session and confirm later compatible turns still behave coherently.
-- Confirm `details.remoteCompaction.implementation` is `responses_compaction_v2`.
-- Confirm replacement history ends with an opaque `compaction` item and retains only the recent user-message budget outside that item.
-
-### 4. `/model` safety
-- After remote compaction, switch to another model with `/model`.
-- Confirm the session continues normally.
-- Switch back to the original direct OpenAI model.
-- Confirm the session still works, does not crash, and does not reuse polluted remote history.
-- Restart or reload after that round-trip and confirm reconstructed remote replay still excludes the intervening other-model turns.
-
-### 5. Tree/fork safety
-- Compact, then use `/tree` or fork navigation.
-- Confirm session remains usable.
-- Confirm stale WS / previous-response state is not reused incorrectly.
-
-### 6. Resume/reload safety
-- Compact remotely.
-- Restart Pi or reload extensions.
-- Resume the same session.
-- Confirm remote compaction state is reconstructed from compaction details.
-
-### 7. Cost accounting
-- Use the supported provider path for several turns.
-- Confirm footer/session stats show non-zero token/cost totals.
-- Compare rough totals against dashboard/provider logs when possible.
-
-## Automated live test
+Run:
 
 ```bash
-cd /home/algal/gits/pi-openai-server-compaction
-node --experimental-strip-types ./tests/live/openai-compaction-rpc-live.ts
-PI_OPENAI_SERVER_COMPACTION_TEST_MODEL=openai/gpt-5.6-luna node --experimental-strip-types ./tests/live/openai-compaction-rpc-live.ts
-PI_OPENAI_SERVER_COMPACTION_TEST_MODEL=openai-codex/gpt-5.6-sol node --experimental-strip-types ./tests/live/openai-compaction-rpc-live.ts
+npm test
 ```
 
-The automated live harness lives in `tests/live/openai-compaction-rpc-live.ts`.
+The smoke suite must verify:
 
-Current automated coverage includes:
-- compaction continuity in the same session
-- `/model`-style switch away and back again
-- fork after compaction
-- resume/reload after compaction
-- resume/reload after switching away from and back to the compacted model
+- the extension factory does not call `registerProvider`;
+- Pi `0.84.1` imports and types compile;
+- direct OpenAI and OpenAI Codex endpoints are correct;
+- requests include `store: false` and one trailing `compaction_trigger`;
+- inherited `Authorization` headers cannot replace the selected credential;
+- response normalization removes stale developer/ghost state and repairs tool-call pairs;
+- unsupported images are replaced safely;
+- returned and persisted opaque items require non-empty encrypted content;
+- malformed persisted details fail closed as a complete unit;
+- version 2 history has exactly one final `compaction` item;
+- repeat compaction uses the newest artifact;
+- cross-model turns do not enter reconstructed replay;
+- failed or aborted turns are dropped before a new user turn, while immediate automatic retries keep their original user input;
+- enabled replay replaces provider input through `before_provider_request`;
+- disabled mode leaves Pi's portable payload unchanged;
+- Pi core projects the readable summary while ignoring opaque extension details;
+- transient HTTP failure retries within the configured bound;
+- permanent `4xx` failure does not retry;
+- timeout aborts an attempt;
+- malformed SSE does not retry.
 
-Recommended follow-up live regression:
-- explicit tree navigation after an intervening other-model turn, followed by restart
+## Live automated checks
 
-## Controlled compaction benchmark
+Live tests use real provider credentials and incur API usage:
 
-The native-vs-text benchmark, reproduction instructions, retained evidence, and report live under:
-- `benchmarks/native-vs-text/`
+```bash
+npm run test:live
+PI_OPENAI_SERVER_COMPACTION_TEST_MODEL=openai/gpt-5.4 npm run test:live
+PI_OPENAI_SERVER_COMPACTION_TEST_MODEL=openai-codex/gpt-5.4 npm run test:live
+```
+
+The current RPC harness covers:
+
+- same-process opaque continuity after compaction;
+- recovery of information absent from visible retained plaintext;
+- model switch away and back;
+- fork after compaction;
+- resume after compaction;
+- resume after a model round trip.
+
+## Required release regressions
+
+Before releasing 0.2, add or run these scenarios against Pi `0.84.x`:
+
+### Repeated compaction
+
+1. Store a fact.
+2. Compact.
+3. Add another fact.
+4. Compact again.
+5. Verify both facts on the original model.
+6. Restart and verify both facts again.
+7. Confirm the latest session entry contains one final artifact and no obsolete artifact.
+
+### Disabled extension
+
+1. Compact with the extension enabled and without instructions that omit the test fact.
+2. Set `PI_OPENAI_SERVER_COMPACTION_ENABLED=0`.
+3. Restart the same session with the extension still loaded.
+4. Verify that the portable summary supports continuation.
+5. Inspect the outgoing request and confirm no opaque history injection.
+
+### Extension absent
+
+1. Compact with the extension enabled and preserve a test fact in the summary.
+2. Restart the same session without loading this extension.
+3. Verify that Pi continues from the portable summary.
+4. Confirm session loading does not depend on extension-specific code.
+
+### Malformed persisted details
+
+1. Copy a test session.
+2. Remove `encrypted_content`, add an unknown item, and corrupt `modelKey` in separate copies.
+3. Resume each copy.
+4. Verify that Pi uses the readable summary and does not send malformed opaque data.
+
+### Model switch and tree safety
+
+1. Compact on model A.
+2. Complete a turn on model B.
+3. Navigate the tree and restart.
+4. Switch back to model A.
+5. Verify that model B's turn is absent from model A's remote replay.
+
+### Native transport
+
+For direct OpenAI models, confirm:
+
+- Pi's normal streaming UI accumulates text correctly;
+- usage and cost come from Pi's provider;
+- no custom WebSocket connection is opened;
+- the extension does not force `store: true`, `context_management`, or `previous_response_id`.
+
+## Manual failure checks
+
+- Cancel compaction and confirm no retry occurs after caller abort.
+- Return HTTP `429` or `503` from a proxy and confirm no more than three total attempts.
+- Stall a proxy response and confirm each attempt stops at five minutes.
+- Return malformed SSE and confirm immediate fallback to the portable summary.
+- Cause both portable summary methods to fail and confirm no remote details are persisted.
+
+## Evidence recording
+
+For each credential-backed run, record:
+
+- Pi version;
+- provider and model;
+- exact command;
+- pass/fail result;
+- session fixture or redacted JSONL evidence;
+- API cost when available;
+- any residual risk.
+
+Do not update `VALIDATION.md` with a live-pass claim until the credential-backed suite completes on the stated Pi version.

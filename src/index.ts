@@ -1,30 +1,28 @@
 /**
  * Main extension entrypoint.
  *
- * Wires together request patching, remote compaction, runtime state
- * reconstruction, session lifecycle cleanup, and provider override registration.
+ * Wires together remote compaction, request replay, runtime state
+ * reconstruction, and session lifecycle cleanup.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionContext,
+  convertToLlm,
+  type CompactionResult,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { isRecord, loadConfig } from "./config.ts";
-import { streamOpenAIResponsesWithPhase2B } from "./custom-stream.ts";
 import {
-  applyPayloadPatch,
   applyRemoteHistoryPayloadPatch,
-  extractAssistantResponseId,
   extractResponsesReasoningConfig,
   extractResponsesTextConfig,
-  isOpenAICodexResponsesModel,
   looksLikeResponsesPayload,
   messageMatchesModel,
   modelKey,
-  supportsPreviousResponseId,
   supportsRemoteCompactionModel,
   thinkingLevelToResponsesReasoning,
 } from "./openai.ts";
-import { releaseAllWsSessions, releaseWsSession } from "./openai-ws-stream.ts";
 import {
-  buildCompactionSummaryText,
   buildRemoteCompactionDetails,
   buildToolsPayload,
   callRemoteCompactionEndpoint,
@@ -33,21 +31,20 @@ import {
   messagesToResponseItems,
   normalizeResponseItemsForPrompt,
   reconstructRemoteCompactionStateFromBranch,
+  type RemoteCompactionResult,
 } from "./remote-compaction.ts";
 import {
-  clearAllContinuationState,
-  clearContinuationState,
+  clearAllRuntimeState,
   clearRemoteCompactionState,
   clearResponsesRequestShapeState,
-  getContinuationState,
   getRemoteCompactionState,
   getResponsesRequestShapeState,
-  setContinuationState,
   setRemoteCompactionState,
   setResponsesRequestShapeState,
 } from "./state.ts";
 
 type TargetModel = Parameters<typeof modelKey>[0];
+type CompactionModel = Parameters<typeof buildRemoteCompactionDetails>[0];
 
 type BranchEntry = {
   type: string;
@@ -68,14 +65,22 @@ function getSessionId(ctx: SessionContextLike): string {
   return ctx.sessionManager.getSessionId();
 }
 
+function normalizeHeaders(
+  headers: Record<string, string | null> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  return Object.fromEntries(
+    Object.entries(headers).filter(
+      (entry): entry is [string, string] =>
+        entry[1] !== null && entry[0].toLowerCase() !== "authorization",
+    ),
+  );
+}
+
 function getBranchMessages(branchEntries: BranchEntry[]): AgentMessage[] {
   return branchEntries.flatMap((entry) =>
     entry.type === "message" && entry.message ? [entry.message as AgentMessage] : [],
   );
-}
-
-function getBranchMessageCount(branchEntries: BranchEntry[]): number {
-  return branchEntries.filter((entry) => entry.type === "message" && Boolean(entry.message)).length;
 }
 
 function getBranchThinkingLevel(branchEntries: BranchEntry[]): string | undefined {
@@ -87,13 +92,7 @@ function getBranchThinkingLevel(branchEntries: BranchEntry[]): string | undefine
   return undefined;
 }
 
-function clearLiveContinuation(sessionId: string | undefined): void {
-  clearContinuationState(sessionId);
-  releaseWsSession(sessionId);
-}
-
 function clearSessionRuntimeState(sessionId: string | undefined): void {
-  clearLiveContinuation(sessionId);
   clearRemoteCompactionState(sessionId);
   clearResponsesRequestShapeState(sessionId);
 }
@@ -130,16 +129,76 @@ function extendRemoteHistoryIfCompatible(params: {
 }): void {
   const remoteState = getMatchingRemoteState(params.sessionId, params.model);
   if (!remoteState || !params.model) return;
-  if (params.message.role === "assistant" && !messageMatchesModel(params.message, params.model)) {
+  if (params.message.role === "assistant" && params.message.stopReason === "aborted") {
+    const explicitHistory = remoteState.pendingTurnStartIndex === undefined
+      ? remoteState.explicitHistory
+      : remoteState.explicitHistory.slice(0, remoteState.pendingTurnStartIndex);
+    setRemoteCompactionState(params.sessionId, {
+      ...remoteState,
+      explicitHistory,
+      pendingTurnStartIndex: undefined,
+      pendingTurnFailed: false,
+    });
+    return;
+  }
+  if (params.message.role === "assistant" && params.message.stopReason === "error") {
+    setRemoteCompactionState(params.sessionId, {
+      ...remoteState,
+      pendingTurnFailed: true,
+    });
     return;
   }
 
   const items = messageToResponseItems(params.message);
   if (items.length === 0) return;
 
+  if (params.message.role === "user") {
+    const shouldDiscardFailedTurn =
+      remoteState.pendingTurnFailed && remoteState.pendingTurnStartIndex !== undefined;
+    const explicitHistory = shouldDiscardFailedTurn
+      ? remoteState.explicitHistory.slice(0, remoteState.pendingTurnStartIndex)
+      : remoteState.explicitHistory;
+    setRemoteCompactionState(params.sessionId, {
+      ...remoteState,
+      explicitHistory: [...explicitHistory, ...items],
+      pendingTurnStartIndex: shouldDiscardFailedTurn || remoteState.pendingTurnStartIndex === undefined
+        ? explicitHistory.length
+        : remoteState.pendingTurnStartIndex,
+      pendingTurnFailed: false,
+    });
+    return;
+  }
+
+  if (params.message.role === "assistant") {
+    if (!messageMatchesModel(params.message, params.model)) return;
+    setRemoteCompactionState(params.sessionId, {
+      ...remoteState,
+      explicitHistory: [...remoteState.explicitHistory, ...items],
+      pendingTurnStartIndex: params.message.stopReason === "toolUse"
+        ? remoteState.pendingTurnStartIndex
+        : undefined,
+      pendingTurnFailed: false,
+    });
+    return;
+  }
+
   setRemoteCompactionState(params.sessionId, {
     ...remoteState,
     explicitHistory: [...remoteState.explicitHistory, ...items],
+  });
+}
+
+function discardSettledFailedTurn(sessionId: string): void {
+  const remoteState = getRemoteCompactionState(sessionId);
+  if (!remoteState?.pendingTurnFailed) return;
+  const explicitHistory = remoteState.pendingTurnStartIndex === undefined
+    ? remoteState.explicitHistory
+    : remoteState.explicitHistory.slice(0, remoteState.pendingTurnStartIndex);
+  setRemoteCompactionState(sessionId, {
+    ...remoteState,
+    explicitHistory,
+    pendingTurnStartIndex: undefined,
+    pendingTurnFailed: false,
   });
 }
 
@@ -161,17 +220,33 @@ function maybeNotifyRequestFeatures(params: {
   params.ui.notify(`OpenAI compaction active for ${key} (${params.features.join(", ")})`, "info");
 }
 
+export function mergeCompactionResults(
+  model: CompactionModel,
+  localResult: PromiseSettledResult<CompactionResult>,
+  remoteResult: PromiseSettledResult<RemoteCompactionResult>,
+): CompactionResult | undefined {
+  if (localResult.status !== "fulfilled") return undefined;
+  if (remoteResult.status !== "fulfilled") return localResult.value;
+
+  const localSummary = localResult.value;
+  return {
+    ...localSummary,
+    details: {
+      ...(localSummary.details !== undefined ? { localSummaryDetails: localSummary.details } : {}),
+      remoteCompaction: buildRemoteCompactionDetails(
+        model,
+        remoteResult.value.output,
+        remoteResult.value.usage,
+      ),
+    },
+  };
+}
+
 export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
   const notifiedModels = new Set<string>();
 
-  pi.registerProvider("openai", {
-    api: "openai-responses",
-    streamSimple: streamOpenAIResponsesWithPhase2B,
-  });
-
   pi.on("session_start", (_event, ctx) => {
     const sessionId = getSessionId(ctx);
-    clearLiveContinuation(sessionId);
     clearResponsesRequestShapeState(sessionId);
     syncRemoteState(ctx);
   });
@@ -184,19 +259,18 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
   pi.on("session_before_tree", clearBeforeSessionChange);
 
   const syncAfterSessionChange = (_event: unknown, ctx: SessionContextLike): void => {
-    clearLiveContinuation(getSessionId(ctx));
+    clearResponsesRequestShapeState(getSessionId(ctx));
     syncRemoteState(ctx);
   };
   pi.on("session_tree", syncAfterSessionChange);
   pi.on("session_compact", syncAfterSessionChange);
 
   pi.on("model_select", (_event, ctx) => {
-    clearLiveContinuation(getSessionId(ctx));
+    clearResponsesRequestShapeState(getSessionId(ctx));
   });
 
   pi.on("session_shutdown", () => {
-    clearAllContinuationState();
-    releaseAllWsSessions();
+    clearAllRuntimeState();
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -206,88 +280,88 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok || !auth.apiKey) return undefined;
+    const headers = normalizeHeaders(auth.headers);
 
     const tools = buildToolsPayload(pi.getAllTools(), pi.getActiveTools());
     const sessionId = getSessionId(ctx);
     const branchEntries = event.branchEntries as BranchEntry[];
     const remoteState = getMatchingRemoteState(sessionId, model);
     const observedRequestShape = getResponsesRequestShapeState(sessionId);
+    const matchingRequestShape = observedRequestShape?.modelKey === modelKey(model)
+      ? observedRequestShape
+      : undefined;
     const fullBranchMessages = getBranchMessages(branchEntries);
+    const portableContextMessages = buildSessionContext(event.branchEntries).messages;
     const responseItems = remoteState
       ? remoteState.explicitHistory
-      : messagesToResponseItems(fullBranchMessages);
+      : messagesToResponseItems(convertToLlm(portableContextMessages) as AgentMessage[]);
     const promptResponseItems = normalizeResponseItemsForPrompt(responseItems, model);
     const thinkingLevel = pi.getThinkingLevel();
     const fallbackReasoning = model.reasoning
       ? thinkingLevelToResponsesReasoning(thinkingLevel ?? getBranchThinkingLevel(branchEntries))
       : undefined;
-    const reasoning = observedRequestShape?.reasoning ?? fallbackReasoning;
-    const text = observedRequestShape?.text;
+    const reasoning = matchingRequestShape?.reasoning ?? fallbackReasoning;
+    const text = matchingRequestShape?.text;
+
+    const remoteAbortController = new AbortController();
+    const remoteSignal = AbortSignal.any([event.signal, remoteAbortController.signal]);
+    const localSummaryPromise = generateBestEffortLocalSummary({
+      preparation: event.preparation,
+      messages: fullBranchMessages,
+      model,
+      apiKey: auth.apiKey,
+      headers,
+      customInstructions: event.customInstructions,
+      signal: event.signal,
+      thinkingLevel,
+      firstKeptEntryId: event.preparation.firstKeptEntryId,
+      tokensBefore: event.preparation.tokensBefore,
+    });
+    const remoteCompactionPromise = callRemoteCompactionEndpoint({
+      model,
+      apiKey: auth.apiKey,
+      headers,
+      sessionId,
+      input: promptResponseItems,
+      instructions: ctx.getSystemPrompt(),
+      tools,
+      parallelToolCalls: true,
+      reasoning,
+      text,
+      signal: remoteSignal,
+    });
+    void localSummaryPromise.catch(() => {
+      remoteAbortController.abort(
+        new DOMException("Remote compaction cancelled because portable summary generation failed.", "AbortError"),
+      );
+    });
 
     const [localResult, remoteResult] = await Promise.allSettled([
-      generateBestEffortLocalSummary({
-        preparation: event.preparation,
-        messages: fullBranchMessages,
-        model,
-        apiKey: auth.apiKey,
-        headers: auth.headers,
-        customInstructions: event.customInstructions,
-        signal: event.signal,
-        thinkingLevel,
-        firstKeptEntryId: event.preparation.firstKeptEntryId,
-        tokensBefore: event.preparation.tokensBefore,
-      }),
-      callRemoteCompactionEndpoint({
-        model,
-        apiKey: auth.apiKey,
-        headers: auth.headers,
-        sessionId,
-        input: promptResponseItems,
-        instructions: ctx.getSystemPrompt(),
-        tools,
-        parallelToolCalls: true,
-        reasoning,
-        text,
-        signal: event.signal,
-      }),
+      localSummaryPromise,
+      remoteCompactionPromise,
     ]);
 
-    if (remoteResult.status !== "fulfilled") {
-      if (localResult.status === "fulfilled") {
-        return { compaction: localResult.value };
-      }
+    if (localResult.status !== "fulfilled") {
       if (!event.signal.aborted && ctx.hasUI) {
-        const message = remoteResult.reason instanceof Error ? remoteResult.reason.message : String(remoteResult.reason);
-        ctx.ui.notify(`OpenAI remote compaction failed; falling back to default compaction. ${message}`, "warning");
+        const message = localResult.reason instanceof Error ? localResult.reason.message : String(localResult.reason);
+        ctx.ui.notify(
+          `Portable summary generation failed; discarding remote compaction and falling back to Pi compaction. ${message}`,
+          "warning",
+        );
       }
       return undefined;
     }
 
-    const remoteDetails = buildRemoteCompactionDetails(
-      model,
-      remoteResult.value.output,
-      remoteResult.value.usage,
-    );
-    const localSummary =
-      localResult.status === "fulfilled"
-        ? localResult.value
-        : {
-            summary: buildCompactionSummaryText(model),
-            firstKeptEntryId: event.preparation.firstKeptEntryId,
-            tokensBefore: event.preparation.tokensBefore,
-          };
+    if (remoteResult.status !== "fulfilled") {
+      if (!event.signal.aborted && ctx.hasUI) {
+        const message = remoteResult.reason instanceof Error ? remoteResult.reason.message : String(remoteResult.reason);
+        ctx.ui.notify(`OpenAI remote compaction failed; using the portable summary. ${message}`, "warning");
+      }
+      return { compaction: localResult.value };
+    }
 
-    return {
-      compaction: {
-        summary: localSummary.summary,
-        firstKeptEntryId: localSummary.firstKeptEntryId,
-        tokensBefore: localSummary.tokensBefore,
-        details: {
-          ...(localSummary.details !== undefined ? { localSummaryDetails: localSummary.details } : {}),
-          remoteCompaction: remoteDetails,
-        },
-      },
-    };
+    const compaction = mergeCompactionResults(model, localResult, remoteResult);
+    return compaction ? { compaction } : undefined;
   });
 
   pi.on("message_end", (event, ctx) => {
@@ -299,20 +373,10 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       model,
       message: event.message,
     });
+  });
 
-    const cfg = loadConfig(ctx.cwd);
-    if (!cfg.enabled || !supportsPreviousResponseId(model, cfg)) return;
-    if (!messageMatchesModel(event.message, model)) return;
-
-    const responseId = extractAssistantResponseId(event.message);
-    if (!responseId) return;
-
-    setContinuationState(sessionId, {
-      responseId,
-      modelKey: modelKey(model),
-      updatedAt: Date.now(),
-      contextLength: getBranchMessageCount(ctx.sessionManager.getBranch() as BranchEntry[]),
-    });
+  pi.on("agent_settled", (_event, ctx) => {
+    discardSettledFailedTurn(getSessionId(ctx));
   });
 
   pi.on("before_provider_request", (event, ctx) => {
@@ -320,54 +384,27 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     if (!cfg.enabled) return undefined;
 
     const model = ctx.model;
-    if (!model || !isRecord(event.payload) || !looksLikeResponsesPayload(event.payload)) return undefined;
+    if (
+      !model ||
+      !supportsRemoteCompactionModel(model) ||
+      !isRecord(event.payload) ||
+      !looksLikeResponsesPayload(event.payload)
+    ) return undefined;
 
     const sessionId = getSessionId(ctx);
     setResponsesRequestShapeState(sessionId, {
+      modelKey: modelKey(model),
       updatedAt: Date.now(),
       reasoning: extractResponsesReasoningConfig(event.payload),
       text: extractResponsesTextConfig(event.payload),
     });
     const remoteState = getMatchingRemoteState(sessionId, model);
 
-    if (isOpenAICodexResponsesModel(model)) {
-      if (!remoteState) return undefined;
-      const payload = applyRemoteHistoryPayloadPatch({
-        payload: event.payload,
-        explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
-      });
-      maybeNotifyRequestFeatures({
-        notifiedModels,
-        hasUI: ctx.hasUI,
-        notify: cfg.notify,
-        ui: ctx.ui,
-        model,
-        features: ["remote_compaction_history"],
-      });
-      return payload;
-    }
-
-    if (!supportsPreviousResponseId(model, cfg)) return undefined;
-
-    const continuation = getContinuationState(sessionId);
-    const previousResponseId =
-      remoteState === undefined && continuation && continuation.modelKey === modelKey(model)
-        ? continuation.responseId
-        : undefined;
-
-    const payload = applyPayloadPatch({
+    if (!remoteState) return undefined;
+    const payload = applyRemoteHistoryPayloadPatch({
       payload: event.payload,
-      model,
-      cfg,
-      previousResponseId,
+      explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
     });
-
-    const features = ["store=true", "context_management"];
-    if (remoteState !== undefined) {
-      features.push("remote_compaction_history");
-    } else if (previousResponseId) {
-      features.push("previous_response_id");
-    }
 
     maybeNotifyRequestFeatures({
       notifiedModels,
@@ -375,7 +412,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       notify: cfg.notify,
       ui: ctx.ui,
       model,
-      features,
+      features: ["remote_compaction_history"],
     });
 
     return payload;

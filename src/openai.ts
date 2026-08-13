@@ -1,12 +1,12 @@
 /**
- * OpenAI/Azure/Codex model and payload helpers.
+ * OpenAI/Codex model and payload helpers.
  *
- * Keeps provider-specific detection, request patching, endpoint classification,
+ * Keeps provider-specific detection, replay patching, endpoint classification,
  * and model-key logic out of the higher-level extension wiring.
  */
-import type { ExtensionConfig, JsonRecord } from "./config.ts";
+import type { JsonRecord } from "./config.ts";
 import type { ResponsesReasoningConfig, ResponsesTextConfig } from "./remote-compaction.ts";
-import { isRecord, toPositiveInteger } from "./config.ts";
+import { isRecord } from "./config.ts";
 
 export type ModelLike = {
   api?: unknown;
@@ -19,14 +19,6 @@ export type ModelLike = {
   input?: readonly unknown[];
 };
 
-type AssistantMessageLike = {
-  role?: unknown;
-  provider?: unknown;
-  model?: unknown;
-  responseId?: unknown;
-  stopReason?: unknown;
-};
-
 export function hostnameFromBaseUrl(baseUrl: unknown): string | undefined {
   if (typeof baseUrl !== "string" || !baseUrl.trim()) return undefined;
   try {
@@ -34,13 +26,6 @@ export function hostnameFromBaseUrl(baseUrl: unknown): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-export function supportsStore(model: unknown): boolean {
-  if (!isRecord(model)) return true;
-  const compat = model.compat;
-  if (!isRecord(compat)) return true;
-  return compat.supportsStore !== false;
 }
 
 export function isOpenAIResponsesModel(model: unknown): model is ModelLike {
@@ -61,14 +46,6 @@ export function isDirectOpenAIResponsesModel(model: ModelLike): boolean {
   return host === undefined || host === "api.openai.com";
 }
 
-export function isAzureOpenAIResponsesModel(model: ModelLike): boolean {
-  if (model.api !== "azure-openai-responses" && model.api !== "openai-responses") return false;
-  const provider = typeof model.provider === "string" ? model.provider : "";
-  if (provider === "azure-openai" || provider === "azure-openai-responses") return true;
-  const host = hostnameFromBaseUrl(model.baseUrl);
-  return typeof host === "string" && host.endsWith(".openai.azure.com");
-}
-
 export function isOpenAICodexResponsesModel(model: ModelLike): boolean {
   if (model.api !== "openai-codex-responses") return false;
   const provider = typeof model.provider === "string" ? model.provider : "";
@@ -77,28 +54,9 @@ export function isOpenAICodexResponsesModel(model: ModelLike): boolean {
   return host === "chatgpt.com";
 }
 
-export function supportsPreviousResponseId(
-  model: unknown,
-  cfg: Required<ExtensionConfig>,
-): model is ModelLike {
-  if (!isOpenAIResponsesModel(model)) return false;
-  if (isDirectOpenAIResponsesModel(model)) return true;
-  return cfg.includeAzure && isAzureOpenAIResponsesModel(model);
-}
-
 export function supportsRemoteCompactionModel(model: unknown): model is ModelLike {
   if (!isOpenAIResponsesModel(model)) return false;
   return isDirectOpenAIResponsesModel(model) || isOpenAICodexResponsesModel(model);
-}
-
-export function resolveCompactThreshold(
-  model: ModelLike,
-  cfg: Required<ExtensionConfig>,
-): number {
-  if (cfg.compactThreshold > 0) return Math.floor(cfg.compactThreshold);
-  const contextWindow = toPositiveInteger(model.contextWindow);
-  if (contextWindow) return Math.max(1000, Math.floor(contextWindow * cfg.thresholdRatio));
-  return 80000;
 }
 
 export function looksLikeResponsesPayload(payload: JsonRecord): boolean {
@@ -107,38 +65,6 @@ export function looksLikeResponsesPayload(payload: JsonRecord): boolean {
 
 export function modelKey(model: ModelLike): string {
   return `${String(model.provider)}:${String(model.api)}:${String(model.id)}`;
-}
-
-export function applyPayloadPatch(params: {
-  payload: JsonRecord;
-  model: ModelLike;
-  cfg: Required<ExtensionConfig>;
-  previousResponseId?: string;
-}): JsonRecord {
-  const nextPayload: JsonRecord = { ...params.payload };
-
-  if (supportsStore(params.model)) {
-    nextPayload.store = true;
-  }
-
-  if (nextPayload.context_management === undefined) {
-    nextPayload.context_management = [
-      {
-        type: "compaction",
-        compact_threshold: resolveCompactThreshold(params.model, params.cfg),
-      },
-    ];
-  }
-
-  if (
-    params.cfg.usePreviousResponseId &&
-    params.previousResponseId &&
-    nextPayload.previous_response_id === undefined
-  ) {
-    nextPayload.previous_response_id = params.previousResponseId;
-  }
-
-  return nextPayload;
 }
 
 export function thinkingLevelToResponsesReasoning(
@@ -162,6 +88,7 @@ export function applyRemoteHistoryPayloadPatch(params: {
   };
   delete nextPayload.messages;
   delete nextPayload.previous_response_id;
+  delete nextPayload.conversation;
   return nextPayload;
 }
 
@@ -184,17 +111,11 @@ export function extractResponsesTextConfig(payload: unknown): ResponsesTextConfi
   return isRecord(payload) && isRecord(payload.text) ? payload.text : undefined;
 }
 
-export function extractAssistantResponseId(message: unknown): string | undefined {
-  if (!isRecord(message)) return undefined;
-  const msg = message as AssistantMessageLike;
-  if (msg.role !== "assistant") return undefined;
-  if (msg.stopReason === "error" || msg.stopReason === "aborted") return undefined;
-  return typeof msg.responseId === "string" && msg.responseId.trim()
-    ? msg.responseId
-    : undefined;
-}
-
 export function messageMatchesModel(message: unknown, model: ModelLike): boolean {
   if (!isRecord(message)) return false;
-  return message.provider === model.provider && message.model === model.id;
+  return (
+    message.provider === model.provider &&
+    message.api === model.api &&
+    message.model === model.id
+  );
 }
